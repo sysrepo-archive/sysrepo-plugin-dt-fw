@@ -23,207 +23,183 @@
 #include <syslog.h>
 #include <unistd.h>
 #include <inttypes.h>
-#include <sys/stat.h>
-
-#include <libubox/blobmsg.h>
-#include <libubox/blobmsg_json.h>
-#include <curl/curl.h>
-#include <openssl/ssl.h>
-#include <openssl/x509.h>
-#include <openssl/pem.h>
+#include <time.h>
+#include <sys/utsname.h>
+#include <sys/sysinfo.h>
 
 #include "sysrepo.h"
 #include "sysrepo/plugins.h"
-#include "sysrepo/trees.h"
+
+#include <curl/curl.h>
+#include <openssl/ssl.h>
 
 #include "firmware-upgrade.h"
 
-static int32_t id = 0;
+#define XPATH_MAX_LEN 100
 
-static firmware_job jobs  = { .head = LIST_HEAD_INIT(jobs.head) };
+struct server_data {
+    char *address;
+    char *password;
+    char *certificate;
+    char *ssh_key;
+};
 
-typedef struct curl_data_t {
-    download_info dw;
-    const char *filename;
-    int filesize;
-    int downloaded;
+struct curl_ctx {
+    struct server_data *server;
+    const char *path;
+    size_t n_filesize;
+    size_t n_downloaded;
+    /* datastore_t *progress; */
     FILE *stream;
-} curl_data;
+};
 
-void curl_cleanup()
+static size_t
+firmware_download_(void *buffer, size_t size, size_t nmemb, void *stream)
 {
-    curl_global_cleanup();
-}
+    struct curl_ctx *ctx = (struct curl_ctx *) stream;
 
-void curl_init()
-{
-    curl_global_init(CURL_GLOBAL_DEFAULT);
-}
-
-static size_t throw_away(void *ptr, size_t size, size_t nmemb, void *data)
-{
-    (void)ptr;
-    (void)data;
-    return (size_t)(size * nmemb);
-}
-
-static size_t firmware_fwrite(void *buffer, size_t size, size_t nmemb, void *stream)
-{
-    curl_data *data = (curl_data *)stream;
-    if(data && !data->stream) {
-        data->stream = fopen(data->filename, "wb");
-        if(!data->stream)
+    if (ctx && !ctx->stream) {
+        ctx->stream = fopen(ctx->path, "wb");
+        if(!ctx->stream) {
             return -1;
+        }
     }
 
-    data->downloaded = data->downloaded + (size * nmemb);
-    int percent = (int)(100 * ((double) data->downloaded / (double) data->filesize));
+    ctx ->n_downloaded = ctx->n_downloaded + (size * nmemb);
+    int percent = (int) (100 * ((double) ctx->n_downloaded / (double) ctx->n_filesize));
     if (0 == percent % 10) {
-        char str[20];
+        char str[4];
         sprintf(str, "%d", percent);
-        //ds_set_value(data->progress, str);
     }
 
-    return fwrite(buffer, size, nmemb, data->stream);
+    return fwrite(buffer, size, nmemb, ctx->stream);
 }
 
-static CURLcode sslctx_function(CURL *curl, void *sslctx, void *parm)
+static CURLcode
+firmware_download_ssl(CURL *curl, void *sslctx, void *parm)
 {
-    X509_STORE *store;
-    X509 *cert=NULL;
-    BIO *bio;
-    char *mypem = NULL;
+    /* X509_STORE *store; */
+    /* X509 *cert=NULL; */
+    /* BIO *bio; */
+    /* char *mypem = NULL; */
 
-    curl_data *data = (curl_data *)parm;
-    mypem = (char *) data->dw.certificate;
+    /* struct curl_data *data = (struct curl_data *)parm; */
+    /* mypem = (char *) data->server->certificate; */
 
-    bio = BIO_new_mem_buf(mypem, -1);
+    /* bio = BIO_new_mem_buf(mypem, -1); */
 
-    PEM_read_bio_X509(bio, &cert, 0, NULL);
-    if (NULL == cert)
-        SRP_LOG_DBG_MSG("PEM_read_bio_X509 failed...\n");
+    /* PEM_read_bio_X509(bio, &cert, 0, NULL); */
+    /* if (NULL == cert) */
+    /*     DEBUG("PEM_read_bio_X509 failed...\n"); */
 
-    store=SSL_CTX_get_cert_store((SSL_CTX *) sslctx);
+    /* store=SSL_CTX_get_cert_store((SSL_CTX *) sslctx); */
 
-    if (0 == X509_STORE_add_cert(store, cert))
-        SRP_LOG_DBG_MSG("error adding certificate\n");
+    /* if (0 == X509_STORE_add_cert(store, cert)) */
+    /*     DEBUG("error adding certificate\n"); */
 
-    X509_free(cert);
-    BIO_free(bio);
+    /* X509_free(cert); */
+    /* BIO_free(bio); */
 
     return CURLE_OK ;
 }
 
-static int curl_get(curl_data data, double *filesize)
+
+static int
+firmware_download(struct dl_info *dl_info)
 {
     CURL *curl;
-    CURLcode res;
+    CURLcode rc;
+    FILE *fd_data;
+    const char *cert_type = "PEM";
+    const char *public_keyfile_path = "";
+    const char *private_keyfile_path = "";
 
     curl = curl_easy_init();
-    if(!curl) {
-        return SR_ERR_INTERNAL;
+
+    if (!curl) {
+        goto cleanup;
     }
 
-    if (data.dw.password) {
-        char *tmp =strchr(data.dw.address, '/');
-        char *start = (tmp + 1);
-        if (!tmp)
-            return SR_ERR_INTERNAL;
-        char *stop = strchr(data.dw.address, '@');
-        if (!stop)
-            return SR_ERR_INTERNAL;
-        int len = stop - start;
-        char username[len +1];
-        snprintf(username, len, "%s", (start + 1));
-        char auth[len + strlen(data.dw.password) + 1];
-        snprintf(auth, (len + strlen(data.dw.password) + 2), "%s:%s", username, data.dw.password);
-        curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
-        curl_easy_setopt(curl, CURLOPT_URL, data.dw.address);
-        curl_easy_setopt(curl, CURLOPT_USERPWD, auth);
-        if (filesize) {
-            curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
-            curl_easy_setopt(curl, CURLOPT_FILETIME, 1L);
-            curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, throw_away);
-            curl_easy_setopt(curl, CURLOPT_HEADER, 0L);
-        } else {
-            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, firmware_fwrite);
-            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &data);
-        }
-        curl_easy_setopt(curl, CURLOPT_FAILONERROR, true);
-        res = curl_easy_perform(curl);
+    if (dl_info->credentials.password) {
+        curl_easy_setopt(curl, CURLOPT_USERPWD, "pass"); /* todo real pass */
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, firmware_download_);
 
-        if(CURLE_OK != res)
-            SRP_LOG_DBG_MSG("Curl error\n");
-        else if (filesize)
-            res = curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD, filesize);
-
-        curl_easy_cleanup(curl);
-    } else if (data.dw.certificate) {
-        curl_easy_setopt(curl, CURLOPT_URL, data.dw.address);
-        curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
-        curl_easy_setopt(curl, CURLOPT_HEADER, 0L);
-        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1L);
-        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-        curl_easy_setopt(curl, CURLOPT_SSLCERTTYPE,"PEM");
+    } else if (dl_info->credentials.certificate) {
+        curl_easy_setopt(curl, CURLOPT_SSLCERTTYPE, cert_type);
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-        curl_easy_setopt(curl, CURLOPT_SSL_CTX_FUNCTION, *sslctx_function);
-        curl_easy_setopt(curl, CURLOPT_SSL_CTX_DATA, &data);
-        // 2L -> it has to have the same name in the certificate as is in the URL you operate against.
-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
-        curl_easy_setopt(curl, CURLOPT_FAILONERROR, true);
+        curl_easy_setopt(curl, CURLOPT_SSL_CTX_FUNCTION, firmware_download_ssl);
 
-        if (filesize) {
-            curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
-            curl_easy_setopt(curl, CURLOPT_FILETIME, 1L);
-            curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, throw_away);
-        } else {
-            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, firmware_fwrite);
-            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &data);
-            //curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, firmware_fwrite);
-            //curl_easy_setopt(curl, CURLOPT_HEADERDATA, stderr);
-        }
-        res = curl_easy_perform(curl);
-
-        if(CURLE_OK != res)
-            SRP_LOG_DBG_MSG("Curl error\n");
-        else if (filesize)
-            res = curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD, filesize);
-
-        curl_easy_cleanup(curl);
-    } else if (data.dw.ssh_key) {
-        //Prior to 7.39.0, curl was not computing the public key and it had to be provided manually
-        curl_easy_setopt(curl, CURLOPT_URL, data.dw.address);
+    } else if (dl_info->credentials.ssh_key) {
         curl_easy_setopt(curl, CURLOPT_TRANSFERTEXT, 0);
         curl_easy_setopt(curl, CURLOPT_SSH_AUTH_TYPES, CURLSSH_AUTH_PUBLICKEY);
-        curl_easy_setopt(curl, CURLOPT_SSH_PUBLIC_KEYFILE, "/home/mislav/.ssh/cacert.pem");
-        curl_easy_setopt(curl, CURLOPT_SSH_PRIVATE_KEYFILE, "");
+        curl_easy_setopt(curl, CURLOPT_SSH_PUBLIC_KEYFILE, public_keyfile_path);
+        curl_easy_setopt(curl, CURLOPT_SSH_PRIVATE_KEYFILE, public_keyfile_path);
         curl_easy_setopt(curl, CURLOPT_DIRLISTONLY, 1);
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, firmware_fwrite);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &data);
-        res = curl_easy_perform(curl);
-
-        curl_easy_cleanup(curl);
-
-        if(CURLE_OK != res)
-            SRP_LOG_DBG_MSG("Curl error\n");
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, firmware_download_);
     }
 
-    if(data.stream)
-        fclose(data.stream); /* close the local file */
+    curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+    curl_easy_setopt(curl, CURLOPT_URL, dl_info->address);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, fd_data);
 
-    return SR_ERR_OK;
+    rc = curl_easy_perform(curl);
+
+  cleanup:
+    if (fd_data) {
+        fclose(fd_data);
+    }
+    curl_easy_cleanup(curl);
+
+    return rc;
 }
 
-int
-firmware_commit_cb(const char *xpath, const sr_node_t *input, const size_t input_cnt, sr_node_t **output, size_t *output_cnt, void *private_ctx)
+static char *
+get_current_datetime()
 {
-    SRP_LOG_DBG_MSG("RPC firmware_commit_cb called");
+    time_t t = time(NULL);
+    struct tm *tm = localtime(&t);
+    char s[64];
+    strftime(s, sizeof(s), "%c", tm);
+    printf("%s\n", s);
+    return strdup(s);
+}
+
+static char *
+get_boot_datetime()
+{
+    struct sysinfo info;
+    char s[64];
+    sysinfo(&info);
+    sprintf(s, "%02ld:%02ld:%02ld", info.uptime/3600, info.uptime%3600/60, info.uptime%60); 
+    return strdup(s);
+}
+
+static void
+get_platform_info(struct sys_state *sys_state)
+{
+    struct utsname u;
+    uname(&u);
+    sys_state->platform.os_name = u.sysname;
+    sys_state->platform.os_release = u.release;
+    sys_state->platform.os_version = u.version;
+    sys_state->platform.machine = u.machine;
+}
+
+static void
+init_data(struct sys_state *sys_state)
+{
+    printf("init_data\n");
+    sys_state->clock.current_datetime = get_current_datetime();
+    sys_state->clock.boot_datetime = get_boot_datetime();
+    get_platform_info(sys_state);
+}
+
+static int
+firmware_commit(int job_id, struct model *ctx)
+{
     bool found = false;
-    firmware_job *job, *tmp;
-
-    int32_t job_id = input->data.int32_val;
-
-    list_for_each_entry_safe(job, tmp, &jobs.head, head) {
+    struct firmware_job *job;
+    list_for_each_entry(job, ctx->jobs, head) {
         if (job->id == job_id) {
             found = true;
             break;
@@ -233,150 +209,178 @@ firmware_commit_cb(const char *xpath, const sr_node_t *input, const size_t input
     if (found) {
         execl("/sbin/sysupgrade", "sysupgrade", job->install_target, (char *) NULL);
     } else {
-        return SR_ERR_NOT_FOUND;
+        return -1;
     }
 
-    return SR_ERR_OK;
-}
-
-void
-free_job(firmware_job *job) {
-    if (!job) return;
-    if (job->install_target) free(job->install_target);
-    if (job->dw.address) free(job->dw.address);
-    if (job->dw.password) free(job->dw.password);
-    if (job->dw.certificate) free(job->dw.certificate);
-    if (job->dw.ssh_key) free(job->dw.ssh_key);
-    if (job->dw.install_target) free(job->dw.install_target);
-    free(job);
-    job = NULL;
-}
-
-void
-flush_jobs()
-{
-    firmware_job *elem, *tmp;
-
-    list_for_each_entry_safe(elem, tmp, &jobs.head, head) {
-        free_job(elem);
-        list_del(&elem->head);
-    }
-}
-
-int
-firmware_download_cb(const char *xpath, const sr_node_t *input, const size_t input_cnt, sr_node_t **output, size_t *output_cnt, void *private_ctx)
-{
-    int rc = SR_ERR_OK;
-
-    SRP_LOG_DBG_MSG("RPC firmware_download_cb called");
-    firmware_job *new_job = calloc(1, sizeof(firmware_job));
-
-    // init char data
-    new_job->dw.address = NULL;
-    new_job->dw.password = NULL;
-    new_job->dw.certificate = NULL;
-    new_job->dw.ssh_key = NULL;
-    new_job->dw.install_target = NULL;
-
-    for (size_t i = 0; i < input_cnt; ++i) {
-        sr_node_t *tmp = (sr_node_t *) &input[i];
-
-    if (strcmp(tmp->name, "address") == 0) {
-            new_job->dw.address = strdup(tmp->data.string_val);
-        } else if (strcmp(tmp->name, "password") == 0) {
-            new_job->dw.password = strdup(tmp->first_child->data.string_val);
-        } else if (strcmp(tmp->name, "certificate") == 0) {
-            new_job->dw.certificate = strdup(tmp->first_child->data.string_val);
-        } else if (strcmp(tmp->name, "ssh-key") == 0) {
-            new_job->dw.ssh_key = strdup(tmp->first_child->data.string_val);
-        } else if (strcmp(tmp->name, "install-target") == 0) {
-            new_job->dw.install_target = strdup(tmp->data.string_val);
-        } else if (strcmp(tmp->name, "timeframe") == 0) {
-            new_job->dw.timeframe = tmp->data.int32_val;
-        } else if (strcmp(tmp->name, "retry-count") == 0) {
-            new_job->dw.retry_count = tmp->data.uint8_val;
-        } else if (strcmp(tmp->name, "retry-interval") == 0) {
-            new_job->dw.retry_interval = tmp->data.uint32_val;
-        } else if (strcmp(tmp->name, "retry-interval-increment") == 0) {
-            new_job->dw.retry_interval_increment = tmp->data.uint8_val;
-        }
-    }
-
-    curl_data data = {new_job->dw, NULL, 0, 0, NULL};
-    double filesize = 0.0;
-    rc = curl_get(data, &filesize);
-    if (SR_ERR_OK != rc) goto error;
-
-    const char *firmware_slot = "/tmp";
-
-    ++id;
-    char str_id[20];
-    sprintf(str_id, "%d", id);
-    char filename[25];
-    sprintf(filename, "%s/%s", firmware_slot, str_id);
-
-    data.filename = strdup(filename);
-    new_job->install_target = strdup(filename);
-    data.filesize = (int) filesize;
-    rc = curl_get(data, NULL);
-    if (SR_ERR_OK != rc) goto error;
-
-    rc = sr_new_trees(1, output);
-    if (SR_ERR_OK != rc) goto error;
-    *output_cnt = 1;
-
-    rc = sr_node_set_name(&(*output)[0], "job-id");
-    if (SR_ERR_OK != rc) goto error;
-    (*output)[0].type = SR_INT32_T;
-    (*output)[0].data.int32_val = id;
-
-    new_job->id = id;
-
-    list_add_tail(&new_job->head, &jobs.head);
-
-    return SR_ERR_OK;
-error:
-    free_job(new_job);
-    return rc;
-}
-
-static void
-retrieve_current_config(sr_session_ctx_t *session)
-{
-    return SR_ERR_OK;
+    return 0;
 }
 
 static int
 module_change_cb(sr_session_ctx_t *session, const char *module_name, sr_notif_event_t event, void *private_ctx)
 {
-    retrieve_current_config(session);
+    SRP_LOG_DBG_MSG("opencpe-firmware-mgmt configuration has changed.");
+
     return SR_ERR_OK;
+}
+
+static char *
+xpath_suffix(char *str)
+{
+    char *ptr = strrchr(str, '/') + 1;
+    return strdup(ptr);
+}
+
+static int
+input_to_dl_info(sr_session_ctx_t *sess, const sr_val_t *input, struct dl_info *info)
+{
+    int rc = SR_ERR_OK;
+    int i = 0;
+    char *xpath, *suff;
+    sr_val_t in_val;
+
+    info = calloc(1, sizeof(*info));
+    info->address = input[i++].data.string_val;
+
+    in_val = input[i++];
+    xpath = in_val.xpath;
+
+    suff = xpath_suffix(xpath);
+    if        (!strcmp(suff, "password")) {
+        info->credentials.password = in_val.data.string_val;
+    } else if (!strcmp(suff, "certificate")) {
+        info->credentials.certificate = in_val.data.string_val;
+    } else if (!strcmp(suff, "ssh-key")) {
+        info->credentials.ssh_key = in_val.data.string_val;
+    }
+
+    in_val = input[i++];
+    info->install_target = in_val.data.string_val;
+
+    in_val = input[i++];
+    info->timeframe = in_val.data.int32_val;
+
+    in_val = input[i++];
+    info->retry_count= in_val.data.uint8_val;
+
+    in_val = input[i++];
+    info->retry_interval= in_val.data.uint32_val;
+
+    in_val = input[i++];
+    info->retry_interval_increment = (uint8_t) in_val.data.uint32_val;
+
+    return rc;
+}
+
+static int
+rpc_firmware_download_cb(const char *xpath, const sr_val_t *input, const size_t input_cnt,
+                         sr_val_t **output, size_t *output_cnt, void *private_ctx)
+{
+    int rc = SR_ERR_OK;
+    sr_session_ctx_t *session = (sr_session_ctx_t *)private_ctx;
+
+    SRP_LOG_DBG_MSG("'firmware-download' RPC called.");
+
+    int32_t job_id = 0;
+    (*output)[0].type = SR_INT32_T;
+    (*output)[0].data.int32_val = job_id;
+    *output_cnt = 1;
+
+    return rc;
+}
+
+static int
+rpc_firmware_commit_cb(const char *xpath, const sr_val_t *input, const size_t input_cnt,
+                       sr_val_t **output, size_t *output_cnt, void *private_ctx)
+{
+    SRP_LOG_DBG_MSG("'firmware-commit' RPC called.");
+
+    int job_id = (int) (input->data.uint32_val);
+
+    return firmware_commit(job_id, (struct model *) private_ctx);
+}
+
+static int
+rpc_set_bootorder_cb(const char *xpath, const sr_val_t *input, const size_t input_cnt,
+                     sr_val_t **output, size_t *output_cnt, void *private_ctx)
+{
+    int rc = SR_ERR_OK;
+
+    SRP_LOG_DBG_MSG("'set-bootorder' RPC called.");
+
+    rc = sr_new_values(1, output);
+    if (SR_ERR_OK != rc) {
+        return rc;
+    }
+
+    *output_cnt = 1;
+    (*output)[0].type = SR_STRING_T;
+    (*output)[0].data.string_val = "Board specific";
+
+    return rc;
+}
+
+static const size_t n_rpc_method = 3;
+static const struct rpc_method rpc[] = {
+    {"firmware-download", rpc_firmware_download_cb},
+    {"firmware-commit", rpc_firmware_commit_cb},
+    {"set-bootorder", rpc_set_bootorder_cb},
+};
+
+static int
+init_rpc_cb(sr_session_ctx_t *session, sr_subscription_ctx_t *subscription)
+{
+    int rc = SR_ERR_OK;
+    char path[XPATH_MAX_LEN];
+
+    for (int i = 0; i < n_rpc_method; i++) {
+        snprintf(path, XPATH_MAX_LEN, "/opencpe-firmware-mgmt:%s", rpc[i].name);
+        printf("PATH: %s\n", path);
+        rc = sr_rpc_subscribe(session, path, rpc[i].method, NULL,
+                              SR_SUBSCR_CTX_REUSE, &subscription);
+        if (SR_ERR_OK != rc) {
+            break;
+        }
+    }
+
+    return rc;
 }
 
 int
 sr_plugin_init_cb(sr_session_ctx_t *session, void **private_ctx)
 {
     sr_subscription_ctx_t *subscription = NULL;
+    struct model *model;
     int rc = SR_ERR_OK;
 
-    rc = sr_module_change_subscribe(session, "opencpe-firmware-mgmt", module_change_cb, NULL, 0,
-            SR_SUBSCR_CTX_REUSE, &subscription);
+    rc = sr_module_change_subscribe(session, "opencpe-firmware-mgmt", module_change_cb, NULL,
+                                    0, SR_SUBSCR_DEFAULT, &subscription);
     if (SR_ERR_OK != rc) {
         goto error;
     }
 
-    rc = sr_rpc_subscribe_tree(session, "/opencpe-firmware-mgmt:firmware-commit", firmware_commit_cb, "shutdown -h now", SR_SUBSCR_CTX_REUSE, &subscription);
-    if (SR_ERR_OK != rc) goto error;
+    rc = init_rpc_cb(session, subscription);
+    if (SR_ERR_OK != rc) {
+        goto error;
+    }
 
-    rc = sr_rpc_subscribe_tree(session, "/opencpe-firmware-mgmt:firmware-download", firmware_download_cb, "shutdown -h now", SR_SUBSCR_CTX_REUSE, &subscription);
-    if (SR_ERR_OK != rc) goto error;
+    SRP_LOG_DBG_MSG("firmware plugin initialized successfully");
 
+    model = calloc(1, sizeof(*model));
+
+    struct list_head jobs = LIST_HEAD_INIT(jobs);
+    /* set subscription as our private context */
     *private_ctx = subscription;
+
+    struct sys_state *sys_state = calloc(1, sizeof(*sys_state));
+    init_data(sys_state);
+    fprintf(stderr, "current time %s\n" "boot time %s\n",
+            sys_state->clock.current_datetime,
+            sys_state->clock.boot_datetime);
 
     return SR_ERR_OK;
 
-error:
-    SRP_LOG_ERR("plugin initialization failed: %s", sr_strerror(rc));
+  error:
+    SRP_LOG_ERR("firmware-commit plugin initialization failed: %s", sr_strerror(rc));
     sr_unsubscribe(session, subscription);
     return rc;
 }
@@ -387,6 +391,5 @@ sr_plugin_cleanup_cb(sr_session_ctx_t *session, void *private_ctx)
     /* subscription was set as our private context */
     sr_unsubscribe(session, private_ctx);
 
-    flush_jobs();
-    SRP_LOG_ERR_MSG("plugin cleanup finished");
+    SRP_LOG_DBG_MSG("opencpe-firmware-mgmt plugin cleanup finished.");
 }
